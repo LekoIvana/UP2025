@@ -1,11 +1,47 @@
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, EmailStr, validator
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 import redis
 import json
 from passlib.context import CryptContext
+
+import jwt
+from datetime import datetime, timedelta
+from fastapi import Depends, HTTPException, status
+from fastapi import APIRouter, Depends
+from pydantic import EmailStr
+import secrets
+from fastapi import Request
+from fastapi.security import OAuth2PasswordBearer
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+from fastapi import FastAPI, Depends
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.responses import JSONResponse
+from sqlalchemy import func
+
+
+# Generira nasumičan 32-byte hex ključ
+#print(secrets.token_hex(32))
+
+from dotenv import load_dotenv
+import os
+
+# Učitaj varijable iz .env datoteke
+load_dotenv()
+
+# Dohvati SECRET_KEY iz .env datoteke
+SECRET_KEY = os.getenv("SECRET_KEY")
+
+if not SECRET_KEY:
+    raise ValueError("SECRET_KEY is not set in the environment variables")
+
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30  # Token ističe nakon 30 minuta
+
+
 
 DATABASE_URL = "mysql+pymysql://root:db2025@localhost:3307/kino"
 engine = create_engine(DATABASE_URL)
@@ -15,12 +51,22 @@ Base = declarative_base()
 redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 password_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 # Models
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(100), unique=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
+    is_admin = Column(Boolean, default=False)
 
 class Movie(Base):
     __tablename__ = "movies"
@@ -58,7 +104,7 @@ Base.metadata.create_all(bind=engine)
 
 # Schemas
 class UserCreate(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
     @validator("password")
@@ -125,13 +171,46 @@ class ReservationResponse(BaseModel):
     class Config:
         orm_mode = True
 
-# Utility functions
-def get_db():
-    db = SessionLocal()
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+app = FastAPI()
+
+
+
+def create_access_token(data: dict, expires_delta: timedelta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + expires_delta
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# Autentifikacija korisnika
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == form_data.username).first()
+    if not db_user or not verify_password(form_data.password, db_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Invalid credentials.")
+
+    access_token = create_access_token(data={"sub": db_user.email, "is_admin": db_user.is_admin})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+
+def verify_token(token: str) -> dict:
     try:
-        yield db
-    finally:
-        db.close()
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+# Utility functions
 
 def hash_password(password: str) -> str:
     return password_context.hash(password)
@@ -140,7 +219,22 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return password_context.verify(plain_password, hashed_password)
 
 # FastAPI instance
-app = FastAPI()
+
+
+
+router = APIRouter()
+
+def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
+    payload = verify_token(token)
+    user = db.query(User).filter(User.email == payload["sub"]).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+def is_admin(user: User):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
 
 # User routes
 @app.post("/register", response_model=UserResponse)
@@ -150,27 +244,32 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Email already registered.")
 
     hashed_password = hash_password(user.password)
-    db_user = User(email=user.email, hashed_password=hashed_password)
+    db_user = User(email=user.email, hashed_password=hashed_password, is_admin=False)  # Default is_admin = False
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
     return db_user
 
-@app.post("/login")
+
+@app.post("/login", response_model=Token)
 def login_user(user: UserCreate, db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.email == user.email).first()
     if not db_user or not verify_password(user.password, db_user.hashed_password):
         raise HTTPException(status_code=400, detail="Invalid credentials.")
-    return {"message": "Login successful"}
+
+    access_token = create_access_token(data={"sub": db_user.email, "is_admin": db_user.is_admin})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 # Movie routes
 @app.post("/movies/", response_model=MovieResponse)
-def create_movie(movie: MovieCreate, db: Session = Depends(get_db)):
+def create_movie(movie: MovieCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
+
     db_movie = Movie(title=movie.title, description=movie.description)
     db.add(db_movie)
     db.commit()
     db.refresh(db_movie)
-    redis_client.delete("movies_cache")  # Clear movie cache
     return db_movie
 
 @app.get("/movies/", response_model=list[MovieResponse])
@@ -192,7 +291,10 @@ def get_movie(movie_id: int, db: Session = Depends(get_db)):
     return db_movie
 
 @app.put("/movies/{movie_id}", response_model=MovieResponse)
-def update_movie(movie_id: int, movie: MovieCreate, db: Session = Depends(get_db)):
+def update_movie(movie_id: int, movie: MovieCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
+
     db_movie = db.query(Movie).filter(Movie.id == movie_id).first()
     if not db_movie:
         raise HTTPException(status_code=404, detail="Movie not found")
@@ -201,23 +303,28 @@ def update_movie(movie_id: int, movie: MovieCreate, db: Session = Depends(get_db
     db_movie.description = movie.description
     db.commit()
     db.refresh(db_movie)
-    redis_client.delete("movies_cache")
+    redis_client.delete("movies_cache")  # Opcionalno, za osvježavanje cache-a
     return db_movie
 
 @app.delete("/movies/{movie_id}")
-def delete_movie(movie_id: int, db: Session = Depends(get_db)):
+def delete_movie(movie_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
+
     db_movie = db.query(Movie).filter(Movie.id == movie_id).first()
     if not db_movie:
         raise HTTPException(status_code=404, detail="Movie not found")
 
     db.delete(db_movie)
     db.commit()
-    redis_client.delete("movies_cache")
     return {"message": "Movie deleted successfully"}
 
 # Hall routes
 @app.post("/halls/", response_model=HallResponse)
-def create_hall(hall: HallCreate, db: Session = Depends(get_db)):
+def create_hall(hall: HallCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
+
     db_hall = Hall(name=hall.name, capacity=hall.capacity)
     db.add(db_hall)
     db.commit()
@@ -237,7 +344,10 @@ def get_hall(hall_id: int, db: Session = Depends(get_db)):
     return db_hall
 
 @app.put("/halls/{hall_id}", response_model=HallResponse)
-def update_hall(hall_id: int, hall: HallCreate, db: Session = Depends(get_db)):
+def update_hall(hall_id: int, hall: HallCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
+
     db_hall = db.query(Hall).filter(Hall.id == hall_id).first()
     if not db_hall:
         raise HTTPException(status_code=404, detail="Hall not found")
@@ -248,8 +358,12 @@ def update_hall(hall_id: int, hall: HallCreate, db: Session = Depends(get_db)):
     db.refresh(db_hall)
     return db_hall
 
+
 @app.delete("/halls/{hall_id}")
-def delete_hall(hall_id: int, db: Session = Depends(get_db)):
+def delete_hall(hall_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
+
     db_hall = db.query(Hall).filter(Hall.id == hall_id).first()
     if not db_hall:
         raise HTTPException(status_code=404, detail="Hall not found")
@@ -258,14 +372,19 @@ def delete_hall(hall_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Hall deleted successfully"}
 
+
 # Projection routes
 @app.post("/projections/", response_model=ProjectionResponse)
-def create_projection(projection: ProjectionCreate, db: Session = Depends(get_db)):
+def create_projection(projection: ProjectionCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
+
     db_projection = Projection(movie_id=projection.movie_id, hall_id=projection.hall_id, time=projection.time)
     db.add(db_projection)
     db.commit()
     db.refresh(db_projection)
     return db_projection
+
 
 @app.get("/projections/", response_model=list[ProjectionResponse])
 def list_projections(db: Session = Depends(get_db)):
@@ -280,7 +399,10 @@ def get_projection(projection_id: int, db: Session = Depends(get_db)):
     return db_projection
 
 @app.put("/projections/{projection_id}", response_model=ProjectionResponse)
-def update_projection(projection_id: int, projection: ProjectionCreate, db: Session = Depends(get_db)):
+def update_projection(projection_id: int, projection: ProjectionCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
+
     db_projection = db.query(Projection).filter(Projection.id == projection_id).first()
     if not db_projection:
         raise HTTPException(status_code=404, detail="Projection not found")
@@ -292,8 +414,12 @@ def update_projection(projection_id: int, projection: ProjectionCreate, db: Sess
     db.refresh(db_projection)
     return db_projection
 
+
 @app.delete("/projections/{projection_id}")
-def delete_projection(projection_id: int, db: Session = Depends(get_db)):
+def delete_projection(projection_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Not enough privileges")
+
     db_projection = db.query(Projection).filter(Projection.id == projection_id).first()
     if not db_projection:
         raise HTTPException(status_code=404, detail="Projection not found")
@@ -302,36 +428,55 @@ def delete_projection(projection_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Projection deleted successfully"}
 
+
 # Reservation routes
 @app.post("/reservations/", response_model=ReservationResponse)
-def create_reservation(reservation: ReservationCreate, user_id: int = 1, db: Session = Depends(get_db)):
-    # Dohvat projekcije
-    db_projection = db.query(Projection).filter(Projection.id == reservation.projection_id).first()
-    if not db_projection:
-        raise HTTPException(status_code=404, detail="Projection not found.")
+def create_reservation(
+    reservation: ReservationCreate, 
+    db: Session = Depends(get_db), 
+    user: User = Depends(get_current_user)
+):
+    try:
+        # Dohvat projekcije i provjera postojanja
+        db_projection = db.query(Projection).filter(Projection.id == reservation.projection_id).first()
+        if not db_projection:
+            raise HTTPException(status_code=404, detail="Projection not found.")
 
-    # Dohvat dvorane povezane s projekcijom
-    hall_capacity = db_projection.hall.capacity
+        # Dohvat dvorane povezane s projekcijom
+        db_hall = db.query(Hall).filter(Hall.id == db_projection.hall_id).first()
+        if not db_hall:
+            raise HTTPException(status_code=404, detail="Hall not found.")
 
-    # Dohvat ukupno rezerviranih sjedala za tu projekciju
-    total_reserved_seats = db.query(Reservation).filter(
-        Reservation.projection_id == reservation.projection_id
-    ).with_entities(db.func.sum(Reservation.seats_reserved)).scalar() or 0
+        hall_capacity = db_hall.capacity
+        print(f"Hall capacity: {hall_capacity}")
 
-    # Provjera dostupnosti sjedala
-    if total_reserved_seats + reservation.seats_reserved > hall_capacity:
-        raise HTTPException(status_code=400, detail="Not enough seats available.")
+        # Izračun zauzetih sjedala
+        total_reserved_seats = (
+            db.query(func.coalesce(func.sum(Reservation.seats_reserved), 0))
+            .filter(Reservation.projection_id == reservation.projection_id)
+            .scalar()
+        )
+        print(f"Total reserved seats: {total_reserved_seats}")
 
-    # Kreiranje rezervacije
-    db_reservation = Reservation(
-        user_id=user_id,
-        projection_id=reservation.projection_id,
-        seats_reserved=reservation.seats_reserved
-    )
-    db.add(db_reservation)
-    db.commit()
-    db.refresh(db_reservation)
-    return db_reservation
+        # Provjera dostupnosti sjedala
+        if total_reserved_seats + reservation.seats_reserved > hall_capacity:
+            raise HTTPException(status_code=400, detail="Not enough seats available.")
+
+        # Kreiranje rezervacije
+        db_reservation = Reservation(
+            user_id=user.id,
+            projection_id=reservation.projection_id,
+            seats_reserved=reservation.seats_reserved,
+        )
+        db.add(db_reservation)
+        db.commit()
+        db.refresh(db_reservation)
+
+        return db_reservation
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/reservations/", response_model=list[ReservationResponse])
@@ -350,12 +495,16 @@ def get_reservation(reservation_id: int, db: Session = Depends(get_db)):
 def update_reservation(
     reservation_id: int, 
     reservation: ReservationCreate, 
-    user_id: int = 1, 
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db), 
+    user: User = Depends(get_current_user)  # Provjera trenutnog korisnika
 ):
     db_reservation = db.query(Reservation).filter(Reservation.id == reservation_id).first()
     if not db_reservation:
         raise HTTPException(status_code=404, detail="Reservation not found.")
+
+    # Provjeriti ako korisnik pokušava ažurirati svoju rezervaciju
+    if db_reservation.user_id != user.id:
+        raise HTTPException(status_code=403, detail="You can only update your own reservations.")
 
     db_projection = db.query(Projection).filter(Projection.id == reservation.projection_id).first()
     if not db_projection:
@@ -367,13 +516,21 @@ def update_reservation(
     db.refresh(db_reservation)
     return db_reservation
 
+
 @app.delete("/reservations/{reservation_id}")
-def delete_reservation(reservation_id: int, db: Session = Depends(get_db)):
+def delete_reservation(
+    reservation_id: int, 
+    db: Session = Depends(get_db), 
+    user: User = Depends(get_current_user)  # Provjera trenutnog korisnika
+):
     db_reservation = db.query(Reservation).filter(Reservation.id == reservation_id).first()
     if not db_reservation:
         raise HTTPException(status_code=404, detail="Reservation not found.")
 
+    # Provjeriti ako korisnik pokušava obrisati svoju rezervaciju ili ako je administrator
+    if db_reservation.user_id != user.id and not user.is_admin:
+        raise HTTPException(status_code=403, detail="You can only delete your own reservations or be an admin.")
+
     db.delete(db_reservation)
     db.commit()
     return {"message": "Reservation deleted successfully"}
-
